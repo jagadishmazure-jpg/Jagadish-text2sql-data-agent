@@ -1,0 +1,9 @@
+[project]
+name = "text2sql"
+version = "0.1.0"
+description = "Natural language to safe SQL over structured data"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.hatch.build.targets.wheel]
+packages = ["text2sql"]
