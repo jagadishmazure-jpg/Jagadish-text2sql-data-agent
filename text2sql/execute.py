@@ -34,7 +34,7 @@ def _run_with_timeout(conn: sqlite3.Connection, sql: str,
         return cols, rows
     except sqlite3.OperationalError as e:
         if "interrupted" in str(e).lower():
-            raise QueryTimeout(f"query exceeded {timeout_s}s")
+            raise QueryTimeout(f"query exceeded {timeout_s}s") from e
         raise
     finally:
         conn.set_progress_handler(None, 0)

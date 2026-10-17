@@ -130,7 +130,8 @@ def evaluate(db_path: str) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    import tempfile, os
+    import os
+    import tempfile
     path = os.path.join(tempfile.mkdtemp(), "retail.db")
     build_sample_db(path)
     rep = evaluate(path)

@@ -1,100 +1,215 @@
 # Jagadish-text2sql-data-agent
 
-Natural language to SQL over structured data — addressing the explicitly
-hard **text-to-SQL** problem: schema grounding, safe execution, query
-validation, and result explanation.
+[![ci](https://github.com/jagadishmazure-jpg/Jagadish-text2sql-data-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/jagadishmazure-jpg/Jagadish-text2sql-data-agent/actions/workflows/ci.yml)
+[![codeql](https://github.com/jagadishmazure-jpg/Jagadish-text2sql-data-agent/actions/workflows/codeql.yml/badge.svg)](https://github.com/jagadishmazure-jpg/Jagadish-text2sql-data-agent/actions/workflows/codeql.yml)
+![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-## The problem
+**Natural language to SQL that is safe to point at a real database: schema grounding, parameterised templates, a read-only guard with role-based PII rules, and answers that cite the numbers.**
 
-LLMs are fluent at prose and shaky at rows and columns. Point one at a
-database and you get three failure modes: hallucinated tables/columns,
-unbounded or destructive queries, and answers with no cited numbers.
-This repo makes text-to-SQL production-safe with a deterministic core:
+> Personal learning and portfolio project. Everything runs offline on synthetic,
+> fictional data with no API keys. Nothing is deployed. Numbers in this README
+> come from real runs and are re-checked by CI (`scripts/render_docs.py --check`).
 
-- **Schema grounding** — the parser may only reference tables/columns
-  declared in `text2sql/schema.py`; the guard re-validates every query.
-- **Template parsing** — intents (aggregations, filters, joins, top-N)
-  map to *parameterized* SQL. User values are never interpolated.
-- **Safety guard** — read-only enforcement (SELECT only), stacked
-  statements rejected, DDL/DML keywords rejected, unknown identifiers
-  rejected, role-based column allowlist (PII protection), LIMIT cap
-  injected, query timeout via SQLite progress handler.
-- **Clarify, don't guess** — unrecognized intents or missing slots
-  return what was understood and what's ambiguous.
-- **Explained results** — every answer cites the actual numbers.
+## Recruiter summary
+
+- Tackles the hard parts of text-to-SQL: hallucinated columns, destructive or unbounded queries, PII exposure and unexplained answers.
+- Real run: 15-question gold set at 1.00 parse and 1.00 execution accuracy (results compared row by row with hand-written SQL); DROP, stacked statements, PII columns and unknown tables all blocked.
+- Deterministic, offline, SQLite; CI with lint, CodeQL, gitleaks and a documented-output drift check.
+
+## Purpose
+
+Language models are fluent with prose and unreliable with rows and columns. This
+repo shows the engineering around a text-to-SQL agent for a fictional retailer:
+what the generator is allowed to reference, what the database is allowed to run,
+who may see which columns, and how an answer explains itself. The generator here
+is template-based so the guard and evaluation can be studied without a model.
 
 ## Architecture
 
-```
-question
-  │
-  ▼
-parse.generate_sql() ──► parameterized SQL + interpretation
-  │                       (or clarify response)
-  ▼
-guard.validate_sql() ──► read-only? known identifiers?
-  │                       role allowed? LIMIT injected
-  ▼
-execute (SQLite) ──────► rows, with progress-handler timeout
-  │
-  ▼
-explain_result() ──────► natural-language summary citing numbers
+```mermaid
+flowchart LR
+    Q["question + role"] --> P["parse.py<br/>intent + slots -> parameterised SQL"]
+    P -->|"missing slot"| C["clarify: what was understood, what is ambiguous"]
+    P --> G["guard.py<br/>SELECT-only, no stacking, DDL/DML denied,<br/>schema identifiers, role column rules, LIMIT cap"]
+    G -->|"blocked"| B["explained refusal"]
+    G --> X["execute.py<br/>SQLite, timeout"]
+    X --> E["explanation citing the numbers"]
+    S["schema.py"] --> P
+    S --> G
 ```
 
-Full trace per question: interpretation, SQL, params, guard verdict,
-columns, rows, explanation.
+## How it works
 
-## Quickstart
+- **Schema grounding** (`text2sql/schema.py`): tables and columns are declared
+  once; the parser may only use them and the guard re-checks every identifier.
+- **Template parsing** (`text2sql/parse.py`): aggregations, filters, joins and
+  top-N questions map to parameterised SQL. User values are always bound
+  parameters, never string-interpolated.
+- **Guard** (`text2sql/guard.py`): a single SELECT only; `;`-stacked statements and
+  16 DDL/DML keywords rejected; unknown identifiers rejected; a role column
+  allowlist (`analyst` cannot read email or phone, `viewer` also cannot read
+  names); a `LIMIT 1000` cap injected when missing.
+- **Execution** (`text2sql/execute.py`): SQLite with a 5-second timeout via a
+  progress handler.
+- **Evaluation** (`text2sql/eval.py`): each gold question has hand-written
+  reference SQL; generated SQL must contain expected fragments and return the
+  same rows.
 
-```bash
-pip install -e .
-python -m text2sql.eval        # build sample DB + run 15-question gold set
-pytest -q
-```
+Safety design detail: [docs/safety.md](docs/safety.md).
+
+## Real code and output
 
 ```python
-from text2sql.data import build_sample_db
-from text2sql.execute import run_question
+"""Gold-set evaluation, a few questions end to end, and the SQL safety guard on hostile queries (offline)."""
+import os
+import tempfile
 
-build_sample_db("retail.db")
-t = run_question("Top 5 products by revenue", "retail.db")
-print(t["sql"])
-print(t["explanation"])
+from text2sql.data import build_sample_db
+from text2sql.eval import GOLD, evaluate
+from text2sql.execute import run_question
+from text2sql.guard import validate_sql
+from text2sql.schema import retail_schema
+
+db = os.path.join(tempfile.mkdtemp(), "retail.db")
+build_sample_db(db)
+
+rep = evaluate(db)
+print(f"Gold set: {len(GOLD)} questions, parse accuracy {rep['parse_accuracy']:.2f}, "
+      f"execution accuracy {rep['exec_accuracy']:.2f}, failures {len(rep['failures'])}\n")
+
+for q in ["Total revenue in 2024", "Top 3 products by revenue", "Show me the top products by revenue"]:
+    t = run_question(q, db)
+    print(f"Q: {q}")
+    if "sql" in t:
+        print(f"SQL: {t['sql']}  params={t['params']}")
+    print(f"A: {t['explanation']}\n")
+
+schema = retail_schema()
+hostile = [
+    ("analyst", "DROP TABLE customers"),
+    ("analyst", "SELECT name FROM customers; DELETE FROM orders"),
+    ("analyst", "SELECT email FROM customers"),
+    ("viewer", "SELECT name, region FROM customers"),
+    ("analyst", "SELECT secret FROM payroll"),
+    ("admin", "SELECT email FROM customers"),
+]
+print("Safety guard:")
+for role, sql in hostile:
+    v = validate_sql(sql, schema, role=role)
+    print(f"  [{role:7}] {sql:48} -> {'allowed: ' + v['sql'] if v['ok'] else 'blocked: ' + '; '.join(v['errors'])}")
 ```
 
-## Example walkthroughs
+Output of `python examples/demo.py` (real run, re-checked in CI):
 
-**Aggregation:**
-> Q: *What is the total revenue in 2024?*
-> SQL: `SELECT SUM(total) AS revenue FROM orders WHERE strftime('%Y', order_date) = ?`
-> A: *Total revenue in 2024: $68,412.30.*
+<!-- run: python examples/demo.py -->
+```text
+Gold set: 15 questions, parse accuracy 1.00, execution accuracy 1.00, failures 0
 
-**Join:**
-> Q: *Which customers have open tickets?*
-> A: *Customers who have at least one open support ticket: 18 rows…*
+Q: Total revenue in 2024
+SQL: SELECT SUM(total) AS revenue FROM orders WHERE strftime('%Y', order_date) = ?  params=['2024']
+A: Total revenue in 2024: $140,336.85.
 
-**Clarify (not guess):**
-> Q: *Show me the top products by revenue*
-> A: *I understood: you want top products by revenue. To answer precisely
-> I need: How many products? e.g. 'top 5 products by revenue'.*
+Q: Top 3 products by revenue
+SQL: SELECT p.name AS product, SUM(o.total) AS revenue FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY p.name ORDER BY revenue DESC LIMIT ?  params=[3]
+A: Top 3 products by total revenue (3 groups): FluxFan: $14,485.99, TurboTowel: $13,154.40, GlowGlobe: $11,461.58.
 
-**Blocked:**
-> *DROP TABLE customers* → guard rejects: only SELECT queries are allowed.
+Q: Show me the top products by revenue
+A: I understood: you want top products by revenue. To answer precisely I need: How many products? e.g. 'top 5 products by revenue'.
 
-## Production path
+Safety guard:
+  [analyst] DROP TABLE customers                             -> blocked: only SELECT queries are allowed; forbidden keyword: DROP; unknown identifier: drop
+  [analyst] SELECT name FROM customers; DELETE FROM orders   -> blocked: multiple statements are not allowed; forbidden keyword: DELETE; unknown identifier: delete
+  [analyst] SELECT email FROM customers                      -> blocked: column customers.email not allowed for role 'analyst'
+  [viewer ] SELECT name, region FROM customers               -> blocked: column customers.name not allowed for role 'viewer'
+  [analyst] SELECT secret FROM payroll                       -> blocked: unknown identifier: secret
+  [admin  ] SELECT email FROM customers                      -> allowed: SELECT email FROM customers LIMIT 1000
+```
+<!-- /run -->
 
-- Swap the template parser for an LLM constrained by
-  `schema.describe_for_prompt()` + the guard as a validation gate.
-- Point at a real warehouse (the guard's identifier/role checks are
-  dialect-agnostic in structure).
-- Add a vector-backed schema linker for wide schemas.
+## How to run
 
-## Data
+```bash
+git clone https://github.com/jagadishmazure-jpg/Jagadish-text2sql-data-agent.git
+cd Jagadish-text2sql-data-agent
+python -m pip install pytest      # SQLite is in the standard library
+python -m pytest -q          # offline, no keys
+python examples/demo.py
+python scripts/render_docs.py --check   # documented output still matches
+```
 
-All data is synthetic and fictional (seeded RNG): 50 customers,
-200 orders, 30 products, 40 support tickets. `sqlite3` stdlib only —
-no external database needed.
+Test suite size (real collection, re-checked in CI):
 
-## Tests
+<!-- run: python scripts/count_tests.py -->
+```text
+28 tests collected
+```
+<!-- /run -->
 
-31 tests, deterministic, no network or API keys.
+## Guardrails
+
+- Read-only: one SELECT per request; DDL/DML keywords and stacked statements are rejected before execution.
+- Identifiers must exist in the declared schema; invented tables or columns are refused.
+- Role-based column allowlist keeps PII (email, phone) away from analyst and viewer roles.
+- User values are bound parameters, never interpolated into SQL.
+- Row cap (1000) and a query timeout bound every execution.
+- Ambiguous questions get a clarify response instead of a guess.
+
+## Limitations
+
+- The parser is template-based; it covers the question shapes in the gold set, not open-ended language.
+- The 15-question gold set was written alongside the templates, so 1.00 accuracy shows correctness, not generalisation.
+- The guard is a string and identifier checker for SQLite, not a full SQL parser; another dialect needs re-testing.
+- No row-level security; access control is per column and per role.
+
+## Built vs planned
+
+| Capability | Status | Where |
+|---|---|---|
+| Schema registry and template parser | Built | `text2sql/schema.py`, `text2sql/parse.py` |
+| SQL safety guard with role column rules | Built | `text2sql/guard.py` |
+| Timed execution and explained results | Built | `text2sql/execute.py` |
+| Gold-set evaluation (parse + execution) | Built | `text2sql/eval.py` |
+| LLM SQL generator constrained by the schema, behind the same guard | Planned | docs/implementation-guide.md |
+| Azure SQL / Fabric warehouse with Entra row-level security | Planned | docs/implementation-guide.md |
+| Larger, independently written gold set | Planned | not started |
+
+## Implementation guide
+
+The step-by-step path from this offline build to an Azure deployment is in
+[docs/implementation-guide.md](docs/implementation-guide.md). None of it has been
+run; it is a plan.
+
+## Related repositories
+
+| Repo | How it relates |
+|---|---|
+| [Jagadish-governed-data-agent](https://github.com/jagadishmazure-jpg/Jagadish-governed-data-agent) | Deny-first source routing across structured and unstructured data; pairs naturally with this guard |
+| [Jagadish-fabric-enterprise-bi](https://github.com/jagadishmazure-jpg/Jagadish-fabric-enterprise-bi) | Fabric semantic model and governed data agent this could query |
+| [Jagadish-agentic-data-layer](https://github.com/jagadishmazure-jpg/Jagadish-agentic-data-layer) | Metrics layer and data contracts that make NL-to-SQL safer |
+| [Jagadish-soc-analyst-copilot](https://github.com/jagadishmazure-jpg/Jagadish-soc-analyst-copilot) | The same NL-to-query problem for security logs |
+
+## Documentation
+
+- [Safety design](docs/safety.md)
+- [Implementation guide (Azure)](docs/implementation-guide.md)
+- [Interview points](docs/interview-points.md)
+- [Security policy](SECURITY.md)
+
+## Project layout
+
+```
+text2sql/
+  schema.py    declared tables, columns, PII columns
+  data.py      seeded fictional retail database
+  parse.py     intent + slot templates -> parameterised SQL
+  guard.py     read-only, identifier, role and LIMIT checks
+  execute.py   timed execution + explanation
+  eval.py      gold-set evaluation
+examples/demo.py the run shown above
+tests/           offline pytest suite
+```
+
+## License
+
+MIT, see [LICENSE](LICENSE). All data is synthetic; every organisation and person is fictional.

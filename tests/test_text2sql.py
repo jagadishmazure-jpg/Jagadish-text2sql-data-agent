@@ -5,9 +5,8 @@ import tempfile
 
 import pytest
 
-from text2sql import (build_sample_db, evaluate, generate_sql, retail_schema,
-                      run_question, validate_sql)
-from text2sql.parse import (extract_amount, extract_region, extract_topn)
+from text2sql import build_sample_db, evaluate, generate_sql, retail_schema, run_question, validate_sql
+from text2sql.parse import extract_amount, extract_region, extract_topn
 
 
 @pytest.fixture(scope="module")
@@ -56,10 +55,6 @@ def test_sample_db_deterministic():
     p1, p2 = os.path.join(d, "a.db"), os.path.join(d, "b.db")
     build_sample_db(p1)
     build_sample_db(p2)
-    for p in (p1, p2):
-        conn = sqlite3.connect(p)
-        rev = conn.execute("SELECT SUM(total) FROM orders").fetchone()[0]
-        conn.close()
     c1 = sqlite3.connect(p1).execute("SELECT SUM(total) FROM orders").fetchone()[0]
     c2 = sqlite3.connect(p2).execute("SELECT SUM(total) FROM orders").fetchone()[0]
     assert c1 == c2

@@ -12,9 +12,9 @@ queries from templates:
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from .schema import DatabaseSchema, PII_COLUMNS
+from .schema import PII_COLUMNS, DatabaseSchema
 
 FORBIDDEN = {
     "insert", "update", "delete", "drop", "alter", "create", "truncate",
