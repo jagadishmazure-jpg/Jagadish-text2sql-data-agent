@@ -15,6 +15,7 @@
 
 - Tackles the hard parts of text-to-SQL: hallucinated columns, destructive or unbounded queries, PII exposure and unexplained answers.
 - Real run: 15-question gold set at 1.00 parse and 1.00 execution accuracy (results compared row by row with hand-written SQL); DROP, stacked statements, PII columns and unknown tables all blocked.
+- JSON output mode: every answer validated against one declared schema (extra keys, NaN and wrong types rejected), one repair attempt, then a loud escalation that withholds the raw output; repair and escalation rates are counted.
 - Deterministic, offline, SQLite; CI with lint, CodeQL, gitleaks and a documented-output drift check.
 
 ## Purpose
@@ -35,6 +36,7 @@ flowchart LR
     G -->|"blocked"| B["explained refusal"]
     G --> X["execute.py<br/>SQLite, timeout"]
     X --> E["explanation citing the numbers"]
+    X --> J["jsonout.py<br/>RESULT_SCHEMA validate -> repair once -> escalate"]
     S["schema.py"] --> P
     S --> G
 ```
@@ -56,12 +58,23 @@ flowchart LR
   reference SQL; generated SQL must contain expected fragments and return the
   same rows.
 
-Safety design detail: [docs/safety.md](docs/safety.md).
+- **JSON output mode** (`text2sql/jsonout.py`): `answer_json()` returns
+  `{query, rows, row_count, citations}` as a `JSONAnswer` with the decoded
+  payload and the number of repairs it needed. `RESULT_SCHEMA` is the only
+  definition of the shape: `validate_result()` walks it, so unknown keys,
+  NaN/Infinity, booleans posing as integers and empty citations are rejected,
+  plus `row_count == len(rows)`. An invalid answer gets one repair attempt with
+  the errors fed back; after that a `JSONEscalation` names the errors and gives
+  the raw output's length and a short SHA-256, never its contents. `METRICS`
+  counts first-pass, repaired and escalated calls. Floats are rounded to cents.
+
+Safety design detail: [docs/safety.md](docs/safety.md). JSON mode detail:
+[docs/json-mode.md](docs/json-mode.md).
 
 ## Real code and output
 
 ```python
-"""Gold-set evaluation, a few questions end to end, and the SQL safety guard on hostile queries (offline)."""
+"""Gold-set evaluation, questions end to end, the SQL safety guard on hostile queries, and JSON mode (offline)."""
 import os
 import tempfile
 
@@ -69,6 +82,7 @@ from text2sql.data import build_sample_db
 from text2sql.eval import GOLD, evaluate
 from text2sql.execute import run_question
 from text2sql.guard import validate_sql
+from text2sql.jsonout import JSONEscalation, JSONOutputMetrics, answer_json, render_result_json
 from text2sql.schema import retail_schema
 
 db = os.path.join(tempfile.mkdtemp(), "retail.db")
@@ -98,6 +112,20 @@ print("Safety guard:")
 for role, sql in hostile:
     v = validate_sql(sql, schema, role=role)
     print(f"  [{role:7}] {sql:48} -> {'allowed: ' + v['sql'] if v['ok'] else 'blocked: ' + '; '.join(v['errors'])}")
+
+# JSON output mode: schema-validated answer, repair loop, metrics (no row data in errors).
+
+m = JSONOutputMetrics()
+ok = answer_json("Revenue by region", db, metrics=m)
+print(f"\nJSON mode: {ok.raw[:110]}...  repairs={ok.repairs}")
+fixed = answer_json("Revenue by region", db, metrics=m,
+                    producer=lambda t, hint=None: render_result_json(t) if hint else '{"query": "q"}')
+print(f"Schema violation repaired on retry: repairs={fixed.repairs}")
+try:
+    answer_json("Revenue by region", db, metrics=m, producer=lambda t, hint=None: '{"rows": [[NaN]]}')
+except JSONEscalation as exc:
+    print(f"Escalated: {exc}")
+print(f"Metrics: {m.summary()}")
 ```
 
 Output of `python examples/demo.py` (real run, re-checked in CI):
@@ -124,6 +152,11 @@ Safety guard:
   [viewer ] SELECT name, region FROM customers               -> blocked: column customers.name not allowed for role 'viewer'
   [analyst] SELECT secret FROM payroll                       -> blocked: unknown identifier: secret
   [admin  ] SELECT email FROM customers                      -> allowed: SELECT email FROM customers LIMIT 1000
+
+JSON mode: {"query": "Revenue by region", "rows": [["West", 41514.98], ["East", 36991.56], ["South", 36272.21], ["North",...  repairs=0
+Schema violation repaired on retry: repairs=1
+Escalated: JSON output failed validation after 1 repair attempt(s): invalid JSON: non-finite number NaN is not valid JSON (raw output withheld: 17 chars, sha256 e251df3f326b)
+Metrics: calls 3, first-pass valid 0.33, repair rate 0.33, escalation rate 0.33
 ```
 <!-- /run -->
 
@@ -142,7 +175,7 @@ Test suite size (real collection, re-checked in CI):
 
 <!-- run: python scripts/count_tests.py -->
 ```text
-28 tests collected
+52 tests collected
 ```
 <!-- /run -->
 
@@ -154,6 +187,7 @@ Test suite size (real collection, re-checked in CI):
 - User values are bound parameters, never interpolated into SQL.
 - Row cap (1000) and a query timeout bound every execution.
 - Ambiguous questions get a clarify response instead of a guess.
+- JSON answers must match `RESULT_SCHEMA` exactly; anything still invalid after one repair escalates, and the error carries no row data.
 
 ## Limitations
 
@@ -161,6 +195,8 @@ Test suite size (real collection, re-checked in CI):
 - The 15-question gold set was written alongside the templates, so 1.00 accuracy shows correctness, not generalisation.
 - The guard is a string and identifier checker for SQLite, not a full SQL parser; another dialect needs re-testing.
 - No row-level security; access control is per column and per role.
+- The JSON producer here is deterministic, so in this repo the repair and escalation paths are exercised only by injected faulty producers in tests and the demo; real rates would come from a model.
+- Rounding every float to 2 decimal places suits this money-only sample; a schema with non-money floats would need per-column precision.
 
 ## Built vs planned
 
@@ -170,6 +206,7 @@ Test suite size (real collection, re-checked in CI):
 | SQL safety guard with role column rules | Built | `text2sql/guard.py` |
 | Timed execution and explained results | Built | `text2sql/execute.py` |
 | Gold-set evaluation (parse + execution) | Built | `text2sql/eval.py` |
+| JSON output mode: schema validation, repair, escalation, metrics | Built | `text2sql/jsonout.py` |
 | LLM SQL generator constrained by the schema, behind the same guard | Planned | docs/implementation-guide.md |
 | Azure SQL / Fabric warehouse with Entra row-level security | Planned | docs/implementation-guide.md |
 | Larger, independently written gold set | Planned | not started |
@@ -192,6 +229,7 @@ run; it is a plan.
 ## Documentation
 
 - [Safety design](docs/safety.md)
+- [JSON output mode](docs/json-mode.md)
 - [Implementation guide (Azure)](docs/implementation-guide.md)
 - [Interview points](docs/interview-points.md)
 - [Security policy](SECURITY.md)
@@ -206,6 +244,7 @@ text2sql/
   guard.py     read-only, identifier, role and LIMIT checks
   execute.py   timed execution + explanation
   eval.py      gold-set evaluation
+  jsonout.py   JSON answers: schema validation, repair, escalation, metrics
 examples/demo.py the run shown above
 tests/           offline pytest suite
 ```
